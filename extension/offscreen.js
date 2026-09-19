@@ -46,10 +46,6 @@ function floatTo16BitPCM(input) {
   return output;
 }
 
-async function getBackendUrl() {
-  const { backendUrl } = await chrome.storage.local.get('backendUrl');
-  return backendUrl || DEFAULT_BACKEND_URL;
-}
 
 function connectWebSocket(backendUrl) {
   const ws = new WebSocket(backendUrl);
@@ -137,8 +133,8 @@ function connectWebSocket(backendUrl) {
   return ws;
 }
 
-async function startCapture(streamId, watchedUserNameVariants, slackTarget) {
-  const backendUrl = await getBackendUrl();
+async function startCapture(streamId, watchedUserNameVariants, slackTarget, backendUrlOverride) {
+  const backendUrl = backendUrlOverride || DEFAULT_BACKEND_URL;
 
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -220,11 +216,14 @@ chrome.runtime.onMessage.addListener((message) => {
 
   switch (message.type) {
     case START_CAPTURE:
-      startCapture(message.streamId, message.watchedUserNameVariants, message.slackTarget).catch(
-        (error) => {
-          broadcast({ type: CAPTURE_ERROR, message: error.message || 'Failed to start capture' });
-        }
-      );
+      startCapture(
+        message.streamId,
+        message.watchedUserNameVariants,
+        message.slackTarget,
+        message.backendUrl
+      ).catch((error) => {
+        broadcast({ type: CAPTURE_ERROR, message: error.message || 'Failed to start capture' });
+      });
       break;
     case STOP_CAPTURE:
       stopCapture();

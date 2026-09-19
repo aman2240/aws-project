@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Literal, Protocol
 
-import anthropic
+from groq import AsyncGroq
 from pydantic import BaseModel, Field, ValidationError
 
 from asr_base import TranscriptEvent
@@ -116,7 +116,7 @@ def _build_name_pattern(names: list[str]) -> re.Pattern | None:
 # Claude 3 Haiku (named in CLAUDE.md) is retired; Haiku 4.5 is the
 # current latency-optimized model in the same tier. Public (no leading
 # underscore) — answer_drafter.py's second LLM call reuses both.
-LLM_MODEL = "claude-haiku-4-5"
+LLM_MODEL = "openai/gpt-oss-20b"
 LLM_TIMEOUT_SECONDS = 4.0  # Phase 0 latency benchmark; 4s default per spec
 
 _SYSTEM_PROMPT = """You are analyzing a short window of a live meeting transcript to detect whether it contains a decision or question that needs a specific person's input.
@@ -260,7 +260,7 @@ class DecisionPipeline:
         decision_store: "DecisionStoreLike | None" = None,
     ) -> None:
         self.on_decision_batch = on_decision_batch
-        self._llm_client = llm_client or anthropic.AsyncAnthropic(api_key=settings.llm_api_key)
+        self._llm_client = llm_client or AsyncGroq(api_key=settings.llm_api_key)
         self._decision_store = decision_store
         self._sessions: dict[str, _SessionState] = {}
         # Keeps references to in-flight Tier-2/batch tasks so they
@@ -359,12 +359,14 @@ class DecisionPipeline:
 
         try:
             response = await asyncio.wait_for(
-                self._llm_client.messages.create(
+                self._llm_client.chat.completions.create(
                     model=LLM_MODEL,
                     max_tokens=1024,
-                    system=_SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": transcript_text}],
-                    output_config={"format": {"type": "json_schema", "schema": _CLASSIFICATION_SCHEMA}},
+                    messages=[
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user", "content": transcript_text},
+                    ],
+                    response_format={"type": "json_object"},
                 ),
                 timeout=LLM_TIMEOUT_SECONDS,
             )
@@ -382,7 +384,7 @@ class DecisionPipeline:
             )
             return None
 
-        raw_text = next((block.text for block in response.content if block.type == "text"), "")
+        raw_text = response.choices[0].message.content or ""
 
         try:
             data = json.loads(raw_text)

@@ -23,8 +23,20 @@ async def _resolve_channel(slack_target: str) -> str:
     """slack_target may be a Slack user ID (already channel-ready for a
     DM) or an email (needs resolving to a user ID first)."""
     if "@" in slack_target:
-        result = await _client.users_lookupByEmail(email=slack_target)
-        return result["user"]["id"]
+        try:
+            result = await _client.users_lookupByEmail(email=slack_target)
+            return result["user"]["id"]
+        except Exception as exc:
+            logger.warning(
+                "users_lookupByEmail failed for %s (%s); falling back to public channel",
+                slack_target,
+                exc,
+            )
+            convs = await _client.conversations_list(types="public_channel")
+            channels = convs.get("channels", [])
+            if channels:
+                return channels[0]["id"]
+            raise
     return slack_target
 
 

@@ -36,24 +36,27 @@ from tests.fixtures.decision_fixtures import (
 )
 
 
-class _FakeMessages:
+class _FakeCompletions:
     def __init__(self, classify_fn):
         self._classify_fn = classify_fn
 
     async def create(self, **kwargs):
-        content = kwargs["messages"][0]["content"]
+        content = next(
+            (m["content"] for m in kwargs["messages"] if m["role"] == "user"), ""
+        )
         result = self._classify_fn(content)
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=json.dumps(result))])
+        msg = SimpleNamespace(content=json.dumps(result))
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
 
 
 def _fake_detection_client(classify_fn):
-    return SimpleNamespace(messages=_FakeMessages(classify_fn))
+    completions = _FakeCompletions(classify_fn)
+    return SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
 
 async def _fast_draft_create(**kwargs):
-    return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text="Go with Friday. Source: no prior context.")]
-    )
+    msg = SimpleNamespace(content="Go with Friday. Source: no prior context.")
+    return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
 
 
 @contextlib.contextmanager
@@ -77,7 +80,7 @@ def isolate_session():
 def fast_draft_llm(monkeypatch):
     """Default fast/successful answer_drafter LLM — individual tests
     override this (e.g. the timeout test) via their own monkeypatch."""
-    monkeypatch.setattr(answer_drafter, "_llm_client", SimpleNamespace(messages=SimpleNamespace(create=_fast_draft_create)))
+    monkeypatch.setattr(answer_drafter, "_llm_client", SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_fast_draft_create))))
 
 
 @pytest.fixture
@@ -231,7 +234,7 @@ async def test_draft_timeout_still_sends_with_fallback_text(monkeypatch, fake_de
     async def slow_create(**kwargs):
         await asyncio.sleep(100)  # never resolves within the timeout below
 
-    monkeypatch.setattr(answer_drafter, "_llm_client", SimpleNamespace(messages=SimpleNamespace(create=slow_create)))
+    monkeypatch.setattr(answer_drafter, "_llm_client", SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=slow_create))))
     monkeypatch.setattr(answer_drafter, "LLM_TIMEOUT_SECONDS", 0.2)
 
     def classify_fn(content):

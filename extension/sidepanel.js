@@ -294,6 +294,19 @@ setupSaveBtn.addEventListener('click', async () => {
   showMainScreen();
 });
 
+const settingsBtn = document.getElementById('settings-btn');
+if (settingsBtn) {
+  settingsBtn.addEventListener('click', async () => {
+    const { [IDENTITY_STORAGE_KEY]: identity } = await chrome.storage.local.get(IDENTITY_STORAGE_KEY);
+    if (identity) {
+      setupNameInput.value = identity.name || '';
+      setupNameVariantsInput.value = (identity.nameVariants || []).slice(1).join(', ');
+      setupSlackTargetInput.value = identity.slackTarget || '';
+    }
+    showSetupScreen();
+  });
+}
+
 // --- Speaker override -------------------------------------------------
 
 overrideApplyBtn.addEventListener('click', () => {

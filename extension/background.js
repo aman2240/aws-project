@@ -81,13 +81,17 @@ async function startCapture() {
   const meetingSessionId = crypto.randomUUID();
   await setSessionState({ status: 'capturing', meetingSessionId, tabId: tab.id });
 
-  const { [IDENTITY_STORAGE_KEY]: identity } = await chrome.storage.local.get(IDENTITY_STORAGE_KEY);
+  const { [IDENTITY_STORAGE_KEY]: identity, backendUrl } = await chrome.storage.local.get([
+    IDENTITY_STORAGE_KEY,
+    'backendUrl',
+  ]);
 
   chrome.runtime.sendMessage({
     type: START_CAPTURE,
     target: 'offscreen',
     streamId,
     meetingSessionId,
+    backendUrl: backendUrl || null,
     watchedUserNameVariants: identity?.nameVariants ?? [],
     slackTarget: identity?.slackTarget ?? null,
   });

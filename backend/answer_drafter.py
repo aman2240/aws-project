@@ -11,7 +11,7 @@ import asyncio
 import logging
 import re
 
-import anthropic
+from groq import AsyncGroq
 
 from config import settings
 from decision_detector import LLM_MODEL, LLM_TIMEOUT_SECONDS, DecisionRecord
@@ -19,7 +19,7 @@ from decision_store import decision_store
 
 logger = logging.getLogger("ghost.answers")
 
-_llm_client = anthropic.AsyncAnthropic(api_key=settings.llm_api_key)
+_llm_client = AsyncGroq(api_key=settings.llm_api_key)
 
 _FALLBACK_TEXT = "No draft available — this one needs a live answer."
 
@@ -73,11 +73,13 @@ async def draft_answer(decision: DecisionRecord, meeting_id: str) -> str:
 
     try:
         response = await asyncio.wait_for(
-            _llm_client.messages.create(
+            _llm_client.chat.completions.create(
                 model=LLM_MODEL,
                 max_tokens=512,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_content}],
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
             ),
             timeout=LLM_TIMEOUT_SECONDS,
         )
@@ -93,5 +95,5 @@ async def draft_answer(decision: DecisionRecord, meeting_id: str) -> str:
         logger.exception("[meeting_id=%s] draft_answer LLM call failed for decision %s", meeting_id, decision.id)
         return _FALLBACK_TEXT
 
-    text = next((block.text for block in response.content if block.type == "text"), "")
+    text = response.choices[0].message.content or ""
     return text.strip() or _FALLBACK_TEXT

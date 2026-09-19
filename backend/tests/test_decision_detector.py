@@ -24,25 +24,31 @@ from tests.fixtures.decision_fixtures import (
 )
 
 
-class _FakeMessages:
+class _FakeCompletions:
     def __init__(self, classify_fn):
         self._classify_fn = classify_fn
         self.calls: list[str] = []
 
     async def create(self, **kwargs):
-        content = kwargs["messages"][0]["content"]
+        # messages list has system then user; user content is the transcript
+        content = next(
+            (m["content"] for m in kwargs["messages"] if m["role"] == "user"), ""
+        )
         self.calls.append(content)
         result = self._classify_fn(content)
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=json.dumps(result))])
+        msg = SimpleNamespace(content=json.dumps(result))
+        choice = SimpleNamespace(message=msg)
+        return SimpleNamespace(choices=[choice])
 
 
-class _FakeAnthropicClient:
+class _FakeGroqClient:
     def __init__(self, classify_fn):
-        self.messages = _FakeMessages(classify_fn)
+        completions = _FakeCompletions(classify_fn)
+        self.chat = SimpleNamespace(completions=completions)
 
 
 def make_fake_client(classify_fn):
-    return _FakeAnthropicClient(classify_fn)
+    return _FakeGroqClient(classify_fn)
 
 
 class RecordingCallback:

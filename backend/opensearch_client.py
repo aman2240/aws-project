@@ -47,7 +47,13 @@ if settings.opensearch_host:
         _auth = (settings.opensearch_user, settings.opensearch_password)
     # Short timeout so a misconfigured/unreachable host fails fast
     # rather than hanging app startup or a request.
-    _client = AsyncOpenSearch(hosts=[settings.opensearch_host], http_auth=_auth, timeout=5)
+    _client = AsyncOpenSearch(
+        hosts=[settings.opensearch_host],
+        http_auth=_auth,
+        verify_certs=False,
+        ssl_show_warn=False,
+        timeout=5,
+    )
 
 
 async def ensure_index() -> None:

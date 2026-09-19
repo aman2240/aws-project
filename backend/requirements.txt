@@ -11,7 +11,7 @@ sqlalchemy[asyncio]==2.0.35
 aiosqlite==0.20.0
 opensearch-py==2.7.1
 deepgram-sdk==3.7.0
-anthropic==1.6.0
+groq==0.11.0
 pydantic-settings==2.5.2
 pytest==8.3.3
 pytest-asyncio==0.24.0
