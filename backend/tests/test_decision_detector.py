@@ -1,7 +1,7 @@
 """
 Tests decision_detector.DecisionPipeline against the hand-written
 fixtures in tests/fixtures/decision_fixtures.py. The LLM (Tier 2) is
-replaced with a fake Anthropic client so these run fast, free, and
+replaced with a fake LLM client so these run fast, free, and
 deterministically — no real network call, no real API key needed.
 """
 
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from config import settings
-from decision_detector import DecisionPipeline
+from decision_detector import DecisionPipeline, MentionType
 from tests.fixtures.decision_fixtures import (
     MEETING_ID,
     one_clear_decision,
@@ -36,13 +36,13 @@ class _FakeMessages:
         return SimpleNamespace(content=[SimpleNamespace(type="text", text=json.dumps(result))])
 
 
-class _FakeAnthropicClient:
+class _FakeLLMClient:
     def __init__(self, classify_fn):
         self.messages = _FakeMessages(classify_fn)
 
 
 def make_fake_client(classify_fn):
-    return _FakeAnthropicClient(classify_fn)
+    return _FakeLLMClient(classify_fn)
 
 
 class RecordingCallback:
@@ -72,14 +72,19 @@ def _last_line(content: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_throwaway_name_mention_produces_no_decision():
+async def test_a_no_action_mention_produces_no_notification():
+    # Confidence is deliberately high (above threshold) so this test
+    # exercises the actionability gate specifically — mention_type
+    # alone must block notification, not the pre-existing confidence
+    # gate (which is covered elsewhere).
     def classify_fn(content):
         return {
-            "is_decision": False,
+            "mention_type": "NO_ACTION",
+            "mention_quote": "Great to have you Sarah, hope the weather's nice where you are.",
             "requires_action_from": None,
-            "decision_text": "",
-            "context": "",
-            "confidence": 0.1,
+            "decision_text": "Small talk mentioning Sarah's name.",
+            "context": "Just a greeting, nothing decision-relevant.",
+            "confidence": 0.95,
             "urgency": "low",
         }
 
@@ -98,10 +103,12 @@ async def test_a_throwaway_name_mention_produces_no_decision():
 @pytest.mark.asyncio
 async def test_b_one_clear_decision_is_detected():
     expected_text = "Whether to ship on Friday or wait until Monday"
+    expected_quote = "Sarah, should we ship on Friday or wait until Monday?"
 
     def classify_fn(content):
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": expected_quote,
             "requires_action_from": "Sarah",
             "decision_text": expected_text,
             "context": "The team is deciding on a ship date.",
@@ -128,6 +135,8 @@ async def test_b_one_clear_decision_is_detected():
     assert record.urgency == "medium"
     assert record.meeting_id == MEETING_ID
     assert record.status == "pending"
+    assert record.mention_type == MentionType.DIRECT_REQUEST
+    assert record.mention_quote == expected_quote
 
 
 @pytest.mark.asyncio
@@ -141,7 +150,8 @@ async def test_c_three_decisions_land_in_one_batch():
         else:
             text = "Whether to delay the release to next Tuesday"
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": last_line,
             "requires_action_from": "Sarah",
             "decision_text": text,
             "context": "Discussion during the review.",
@@ -169,7 +179,8 @@ async def test_c_three_decisions_land_in_one_batch():
 async def test_d_overlapping_speakers_attributes_correct_speaker():
     def classify_fn(content):
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": "Sarah, should we go with option A or option B for the rollout?",
             "requires_action_from": "Sarah",
             "decision_text": "Whether to go with option A or option B for the rollout",
             "context": "Raj asked Sarah to pick a rollout option.",
@@ -198,7 +209,8 @@ async def test_d_overlapping_speakers_attributes_correct_speaker():
 async def test_e_restated_question_dedups_to_one_record():
     def classify_fn(content):
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": "Sarah, should we bump the rate limit to 1000 requests per minute?",
             "requires_action_from": "Sarah",
             "decision_text": "Whether to bump the rate limit to 1000 requests per minute",
             "context": "Asked twice about the rate limit change.",

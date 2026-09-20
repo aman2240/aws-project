@@ -19,6 +19,7 @@ in place.
 
 import uuid
 from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -26,6 +27,29 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import NullPool
 
 from config import settings
+
+
+def _split_database_url(url: str) -> "tuple[str, dict]":
+    """Managed Postgres providers (Neon, RDS, etc.) commonly append
+    libpq-style query params — `sslmode` (psycopg2's SSL knob) and, for
+    Neon specifically, `channel_binding` (a SCRAM channel-binding hint)
+    — that asyncpg's SQLAlchemy dialect doesn't accept as connect
+    kwargs; leaving either in the URL raises a TypeError. `sslmode` is
+    translated into asyncpg's own `ssl` connect_args; `channel_binding`
+    is simply dropped — it's an optional negotiation hint, not required
+    to establish the connection, and asyncpg negotiates SCRAM itself. A
+    plain local DATABASE_URL with neither param round-trips unchanged,
+    with empty connect_args, so this is a no-op for that path."""
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query))
+    sslmode = query.pop("sslmode", None)
+    query.pop("channel_binding", None)
+    connect_args = {"ssl": sslmode} if sslmode and sslmode != "disable" else {}
+    clean_url = urlunsplit(parts._replace(query=urlencode(query)))
+    return clean_url, connect_args
+
+
+_clean_database_url, _connect_args = _split_database_url(settings.database_url)
 
 # NullPool, not the default pooled engine: asyncpg's connections are
 # bound to the event loop that created them, and a pooled connection
@@ -37,7 +61,7 @@ from config import settings
 # concrete case. NullPool opens a fresh connection per checkout instead
 # of reusing one across loops, which sidesteps the whole class of bug;
 # the overhead is negligible at this project's scale.
-engine = create_async_engine(settings.database_url, poolclass=NullPool)
+engine = create_async_engine(_clean_database_url, poolclass=NullPool, connect_args=_connect_args)
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -60,6 +84,23 @@ DecisionStatus = ENUM(
     name="decision_status",
 )
 
+# Native Postgres enum for decision_detector.MentionType — a brand new
+# enum type, not a widening of DecisionStatus above (mention_type and
+# status are independent concerns: mention_type is the LLM's
+# classification of *how* the person was mentioned, status is the
+# human/Slack-driven workflow state). Named MentionTypeEnum here (not
+# MentionType) purely to avoid any reader confusion with
+# decision_detector.MentionType, the Python Enum this mirrors — there's
+# no actual import collision since the two modules are independent.
+MentionTypeEnum = ENUM(
+    "DIRECT_REQUEST",
+    "ACTION_REQUIRED",
+    "INFORMATIONAL",
+    "REFERENCE",
+    "NO_ACTION",
+    name="mention_type",
+)
+
 
 class Decision(Base):
     __tablename__ = "decisions"
@@ -72,6 +113,8 @@ class Decision(Base):
     speaker: Mapped[str]
     requires_action_from: Mapped[str | None]
     context: Mapped[str]
+    mention_type: Mapped[str] = mapped_column(MentionTypeEnum)
+    mention_quote: Mapped[str]
     confidence: Mapped[float]
     urgency: Mapped[str]
     timestamp: Mapped[datetime] = mapped_column(index=True)

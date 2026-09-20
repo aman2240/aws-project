@@ -1,13 +1,13 @@
 """
 Owns the inbound side of Slack: the FastAPI route that receives
-interactivity payloads (button clicks: approve/reject/join) from
-Slack's request URL, verifies the request signature against
-SLACK_SIGNING_SECRET using the raw body, and responds immediately —
-the actual decision_store update runs afterward via BackgroundTasks so
-Slack never times out waiting and retries the same click. That same
-background task also pushes the update to the side panel's WebSocket
-connection, so approving/rejecting from Slack is reflected live there
-too, not just in Slack.
+interactivity payloads (button clicks — just "✓ Done" now, see
+CLAUDE.md's mention-type migration note) from Slack's request URL,
+verifies the request signature against SLACK_SIGNING_SECRET using the
+raw body, and responds immediately — the actual decision_store update
+runs afterward via BackgroundTasks so Slack never times out waiting and
+retries the same click. That same background task also pushes the
+update to the side panel's WebSocket connection, so clicking Done from
+Slack is reflected live there too, not just in Slack.
 """
 
 import json
@@ -58,11 +58,7 @@ async def slack_interaction(request: Request, background_tasks: BackgroundTasks)
     value = action.get("value", "")
     user_id = payload.get("user", {}).get("id", "unknown")
 
-    if action_id == "join_meeting":
-        # Plain url button — no status update, just acknowledge.
-        return Response(status_code=200)
-
-    if action_id not in ("decision_approve", "decision_reject") or ":" not in value:
+    if action_id != "decision_done" or ":" not in value:
         logger.warning("unrecognized Slack interaction: action_id=%r value=%r", action_id, value)
         return Response(status_code=200)
 
@@ -73,7 +69,15 @@ async def slack_interaction(request: Request, background_tasks: BackgroundTasks)
         logger.warning("malformed decision id in button value: %r", value)
         return Response(status_code=200)
 
-    status = "approved" if status_word == "approve" else "rejected"
+    if status_word != "done":
+        logger.warning("unrecognized status word in button value: %r", value)
+        return Response(status_code=200)
+
+    # "done" reuses the existing "approved" status value rather than
+    # adding a new one — the Slack card's own text/emoji already
+    # communicates "Done" to the human, so there's no real benefit to
+    # an ALTER TYPE migration on the status enum for this.
+    status = "approved"
 
     # Respond to Slack first; update afterward so the click is never
     # held up on (or retried because of) a slow store write.

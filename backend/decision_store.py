@@ -24,7 +24,7 @@ from sqlalchemy import select
 
 import database
 import opensearch_client
-from decision_detector import DecisionRecord
+from decision_detector import DecisionRecord, MentionType
 
 logger = logging.getLogger("ghost.decision_store")
 
@@ -72,6 +72,8 @@ def _row_to_record(row: "database.Decision") -> DecisionRecord:
         speaker=row.speaker,
         requires_action_from=row.requires_action_from,
         context=row.context,
+        mention_type=MentionType(row.mention_type),
+        mention_quote=row.mention_quote,
         confidence=row.confidence,
         urgency=row.urgency,
         timestamp=timestamp,
@@ -90,6 +92,8 @@ class PostgresDecisionStore(DecisionStore):
                     speaker=decision.speaker,
                     requires_action_from=decision.requires_action_from,
                     context=decision.context,
+                    mention_type=decision.mention_type.value,
+                    mention_quote=decision.mention_quote,
                     confidence=decision.confidence,
                     urgency=decision.urgency,
                     # asyncpg is strict where aiosqlite was lenient: it

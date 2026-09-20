@@ -27,20 +27,43 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Literal, Protocol
 
-import anthropic
 from pydantic import BaseModel, Field, ValidationError
 
 from asr_base import TranscriptEvent
 from config import settings
+from groq_llm import GROQ_MODEL, GroqMessagesClient
 
 logger = logging.getLogger("ghost.decisions")
 
 # --- Data model -------------------------------------------------------
 
 DecisionBatchCallback = Callable[[str, "list[DecisionRecord]"], Awaitable[None]]
+
+
+class MentionType(str, Enum):
+    """How a watched-name mention classifies. Replaces the old
+    is_decision boolean (see is_actionable below) — this is the one
+    signal that determines both whether a mention is actionable and,
+    via its human-readable form, what shows on the Slack card."""
+
+    DIRECT_REQUEST = "DIRECT_REQUEST"
+    ACTION_REQUIRED = "ACTION_REQUIRED"
+    INFORMATIONAL = "INFORMATIONAL"
+    REFERENCE = "REFERENCE"
+    NO_ACTION = "NO_ACTION"
+
+
+def is_actionable(mention_type: MentionType) -> bool:
+    """True for mention types that proceed to the debounce/batch window
+    and notification pipeline; False for ones that are still persisted
+    via decision_store.create() (for search/history) but never notified.
+    This is the sole actionability signal now — there is no separate
+    is_decision field to potentially disagree with it."""
+    return mention_type in (MentionType.DIRECT_REQUEST, MentionType.ACTION_REQUIRED)
 
 
 class DecisionRecord(BaseModel):
@@ -50,6 +73,12 @@ class DecisionRecord(BaseModel):
     speaker: str
     requires_action_from: str | None
     context: str
+    # The exact verbatim sentence containing the mention — distinct
+    # from decision_text (a one-sentence summary) and context
+    # (surrounding detail); required, since Tier 2 always produces one
+    # alongside mention_type.
+    mention_type: MentionType
+    mention_quote: str
     confidence: float
     urgency: Literal["low", "medium", "high"]
     timestamp: datetime
@@ -113,28 +142,39 @@ def _build_name_pattern(names: list[str]) -> re.Pattern | None:
 
 # --- Tier 2: LLM classification ----------------------------------------
 
-# Claude 3 Haiku (named in CLAUDE.md) is retired; Haiku 4.5 is the
-# current latency-optimized model in the same tier. Public (no leading
-# underscore) — answer_drafter.py's second LLM call reuses both.
-LLM_MODEL = "claude-haiku-4-5"
+# Claude 3 Haiku (named in CLAUDE.md) is retired; calls now go through
+# Groq (groq_llm.py) — AWS Bedrock was tried and blocked at the AWS
+# account level (see groq_llm.py's docstring), and the direct Anthropic
+# API before that. LLM_MODEL holds Groq's own model name. Public (no
+# leading underscore) — answer_drafter.py's second LLM call reuses both
+# this and LLM_TIMEOUT_SECONDS.
+LLM_MODEL = GROQ_MODEL
 LLM_TIMEOUT_SECONDS = 4.0  # Phase 0 latency benchmark; 4s default per spec
 
-_SYSTEM_PROMPT = """You are analyzing a short window of a live meeting transcript to detect whether it contains a decision or question that needs a specific person's input.
+_SYSTEM_PROMPT = """You are analyzing a short window of a live meeting transcript to classify how a watched person was mentioned.
 
 Respond with a single JSON object:
-- is_decision (bool): true only if the window contains a real decision to be made or a direct question needing someone's input — not small talk or a rhetorical question.
-- requires_action_from (string or null): the name of the person whose input is needed, if identifiable from the transcript; null otherwise.
-- decision_text (string): a one-sentence statement of the decision or question.
+- mention_type (string): exactly one of "DIRECT_REQUEST", "ACTION_REQUIRED", "INFORMATIONAL", "REFERENCE", "NO_ACTION".
+  - DIRECT_REQUEST: the person is directly asked a question or asked to decide something, needing their input right now.
+  - ACTION_REQUIRED: the person is asked or expected to do something (a task, a review, a follow-up), even if not phrased as a question.
+  - INFORMATIONAL: the person is mentioned only to be kept informed — no action or input is actually needed from them.
+  - REFERENCE: the person's name comes up in passing (e.g. attributing a past decision to them, or someone else referring to something they said) — they are not being addressed directly.
+  - NO_ACTION: small talk, a greeting, or any other mention with nothing decision-relevant attached.
+- mention_quote (string): the exact verbatim sentence from the transcript containing the mention — copy it exactly, do not paraphrase.
+- requires_action_from (string or null): the name of the person whose input/action is needed, if identifiable from the transcript; null otherwise.
+- decision_text (string): a one-sentence statement of the decision, question, or request — your best-effort summary even for non-actionable mention types.
 - context (string): 2-3 sentences of surrounding context useful for drafting an answer later.
-- confidence (number 0.0-1.0): how confident you are that this is a real, actionable decision.
-- urgency (string): "low", "medium", or "high".
-
-If nothing in the window is a real decision, set is_decision to false and give your best-effort values for the other fields."""
+- confidence (number 0.0-1.0): how confident you are in this classification.
+- urgency (string): "low", "medium", or "high"."""
 
 _CLASSIFICATION_SCHEMA = {
     "type": "object",
     "properties": {
-        "is_decision": {"type": "boolean"},
+        "mention_type": {
+            "type": "string",
+            "enum": ["DIRECT_REQUEST", "ACTION_REQUIRED", "INFORMATIONAL", "REFERENCE", "NO_ACTION"],
+        },
+        "mention_quote": {"type": "string"},
         "requires_action_from": {"type": ["string", "null"]},
         "decision_text": {"type": "string"},
         "context": {"type": "string"},
@@ -142,7 +182,8 @@ _CLASSIFICATION_SCHEMA = {
         "urgency": {"type": "string", "enum": ["low", "medium", "high"]},
     },
     "required": [
-        "is_decision",
+        "mention_type",
+        "mention_quote",
         "requires_action_from",
         "decision_text",
         "context",
@@ -154,7 +195,13 @@ _CLASSIFICATION_SCHEMA = {
 
 
 class _LLMClassification(BaseModel):
-    is_decision: bool
+    # Pydantic rejects an unrecognized mention_type string with a
+    # ValidationError automatically (it's an Enum-typed field) — caught
+    # by _classify_window's existing (json.JSONDecodeError,
+    # ValidationError) handler, same fail-soft log-and-skip pattern
+    # already used for any other malformed LLM output here.
+    mention_type: MentionType
+    mention_quote: str
     requires_action_from: str | None
     decision_text: str
     context: str
@@ -256,11 +303,11 @@ class DecisionPipeline:
     def __init__(
         self,
         on_decision_batch: DecisionBatchCallback = default_on_decision_batch,
-        llm_client: "anthropic.AsyncAnthropic | None" = None,
+        llm_client: "GroqMessagesClient | None" = None,
         decision_store: "DecisionStoreLike | None" = None,
     ) -> None:
         self.on_decision_batch = on_decision_batch
-        self._llm_client = llm_client or anthropic.AsyncAnthropic(api_key=settings.llm_api_key)
+        self._llm_client = llm_client or GroqMessagesClient()
         self._decision_store = decision_store
         self._sessions: dict[str, _SessionState] = {}
         # Keeps references to in-flight Tier-2/batch tasks so they
@@ -370,14 +417,14 @@ class DecisionPipeline:
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "[meeting_id=%s] LLM classification timed out after %.1fs; treating window as not a decision",
+                "[meeting_id=%s] LLM classification timed out after %.1fs; treating window as not actionable",
                 meeting_id,
                 LLM_TIMEOUT_SECONDS,
             )
             return None
         except Exception:
             logger.exception(
-                "[meeting_id=%s] LLM classification call failed; treating window as not a decision",
+                "[meeting_id=%s] LLM classification call failed; treating window as not actionable",
                 meeting_id,
             )
             return None
@@ -388,8 +435,10 @@ class DecisionPipeline:
             data = json.loads(raw_text)
             classification = _LLMClassification.model_validate(data)
         except (json.JSONDecodeError, ValidationError) as exc:
-            # A single malformed response must never crash the
-            # pipeline — log the raw output and move on.
+            # A single malformed response — including an unrecognized
+            # mention_type string, which Pydantic rejects as a
+            # ValidationError since it's Enum-typed — must never crash
+            # the pipeline. Log the raw output and move on.
             logger.warning(
                 "[meeting_id=%s] failed to parse LLM output (%s); raw output: %r",
                 meeting_id,
@@ -398,9 +447,11 @@ class DecisionPipeline:
             )
             return None
 
-        if not classification.is_decision:
-            return None
-
+        # No more is_decision gate here — mention_type is always
+        # present (NO_ACTION covers "nothing decision-relevant"), and
+        # every above-threshold classification is stored regardless of
+        # type; only actionability (checked in _classify_and_batch)
+        # gates notification.
         return classification
 
     async def _classify_and_batch(
@@ -412,7 +463,7 @@ class DecisionPipeline:
 
         if classification.confidence < settings.confidence_threshold:
             logger.info(
-                "[meeting_id=%s] decision below confidence threshold (%.2f < %.2f): %r",
+                "[meeting_id=%s] mention below confidence threshold (%.2f < %.2f): %r",
                 meeting_id,
                 classification.confidence,
                 settings.confidence_threshold,
@@ -431,10 +482,31 @@ class DecisionPipeline:
             speaker=state.speaker_mapper.resolve(matched_event.speaker),
             requires_action_from=classification.requires_action_from,
             context=classification.context,
+            mention_type=classification.mention_type,
+            mention_quote=classification.mention_quote,
             confidence=classification.confidence,
             urgency=classification.urgency,
             timestamp=matched_event.timestamp,
         )
+
+        # Storage is unconditional once above the confidence threshold,
+        # regardless of mention_type — actionability and dedup (below)
+        # only gate the notification path, not persistence, so every
+        # mention stays searchable/historical.
+        if self._decision_store is not None:
+            try:
+                await self._decision_store.create(record)
+            except Exception:
+                logger.exception("[meeting_id=%s] failed to persist decision %s", meeting_id, record.id)
+
+        if not is_actionable(record.mention_type):
+            logger.info(
+                "[meeting_id=%s] stored, not notified: %s (%r)",
+                meeting_id,
+                record.mention_type.value,
+                record.decision_text,
+            )
+            return
 
         async with state.lock:
             if _is_duplicate(record.decision_text, state.recent_decisions):
@@ -450,16 +522,6 @@ class DecisionPipeline:
             # the notification back indefinitely.
             if state.batch_timer_task is None or state.batch_timer_task.done():
                 state.batch_timer_task = self._track(self._fire_batch_after_delay(meeting_id, state))
-
-        if self._decision_store is not None:
-            # Persisted as soon as it's accepted, not delayed until the
-            # debounce timer fires — that timer is purely a
-            # notification-batching concern. Best-effort: a persistence
-            # failure shouldn't block the batch/notification flow below.
-            try:
-                await self._decision_store.create(record)
-            except Exception:
-                logger.exception("[meeting_id=%s] failed to persist decision %s", meeting_id, record.id)
 
     async def _fire_batch_after_delay(self, meeting_id: str, state: _SessionState) -> None:
         await asyncio.sleep(settings.debounce_window_seconds)

@@ -46,11 +46,6 @@ function floatTo16BitPCM(input) {
   return output;
 }
 
-async function getBackendUrl() {
-  const { backendUrl } = await chrome.storage.local.get('backendUrl');
-  return backendUrl || DEFAULT_BACKEND_URL;
-}
-
 function connectWebSocket(backendUrl) {
   const ws = new WebSocket(backendUrl);
   ws.binaryType = 'arraybuffer';
@@ -137,8 +132,11 @@ function connectWebSocket(backendUrl) {
   return ws;
 }
 
-async function startCapture(streamId, watchedUserNameVariants, slackTarget) {
-  const backendUrl = await getBackendUrl();
+async function startCapture(streamId, watchedUserNameVariants, slackTarget, backendUrl) {
+  // Passed in from background.js (chrome.storage.local read there,
+  // not here — see the START_CAPTURE handler below for why), with the
+  // same default-fallback this used to apply itself.
+  backendUrl = backendUrl || DEFAULT_BACKEND_URL;
 
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -220,9 +218,32 @@ chrome.runtime.onMessage.addListener((message) => {
 
   switch (message.type) {
     case START_CAPTURE:
-      startCapture(message.streamId, message.watchedUserNameVariants, message.slackTarget).catch(
+      startCapture(
+        message.streamId,
+        message.watchedUserNameVariants,
+        message.slackTarget,
+        message.backendUrl
+      ).catch(
         (error) => {
-          broadcast({ type: CAPTURE_ERROR, message: error.message || 'Failed to start capture' });
+          // Logged here (not just relayed) since this .catch() would
+          // otherwise silently swallow the exception — the side panel
+          // only sees error.message as text, never a stack trace, so
+          // without this line the offscreen document's own console
+          // (chrome://extensions -> Inspect views -> offscreen.html)
+          // is the only place the real cause is ever visible.
+          console.error('startCapture failed:', error);
+          // The offscreen document closes itself moments after this
+          // broadcast (background.js's CAPTURE_ERROR handler calls
+          // closeOffscreenDocument()), so its own console — and this
+          // console.error above — is only inspectable in a brief
+          // window that's easy to miss. Forwarding the stack alongside
+          // the message means the side panel's own (stable, already
+          // open) console can show the full detail instead.
+          broadcast({
+            type: CAPTURE_ERROR,
+            message: error.message || 'Failed to start capture',
+            stack: error.stack || null,
+          });
         }
       );
       break;

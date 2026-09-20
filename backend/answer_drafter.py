@@ -11,15 +11,13 @@ import asyncio
 import logging
 import re
 
-import anthropic
-
-from config import settings
 from decision_detector import LLM_MODEL, LLM_TIMEOUT_SECONDS, DecisionRecord
 from decision_store import decision_store
+from groq_llm import GroqMessagesClient
 
 logger = logging.getLogger("ghost.answers")
 
-_llm_client = anthropic.AsyncAnthropic(api_key=settings.llm_api_key)
+_llm_client = GroqMessagesClient()
 
 _FALLBACK_TEXT = "No draft available — this one needs a live answer."
 

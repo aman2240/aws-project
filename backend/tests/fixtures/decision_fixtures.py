@@ -105,6 +105,62 @@ def overlapping_speakers() -> list[TranscriptEvent]:
     )
 
 
+def direct_request_mention() -> list[TranscriptEvent]:
+    """(f) A direct question to Sarah needing her input now —
+    DIRECT_REQUEST."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return _spaced_events(
+        base,
+        MEETING_ID,
+        [
+            ("spk_0", "I'm Sarah, go ahead."),
+            ("spk_1", "Sarah, should we ship on Friday or wait until Monday?"),
+        ],
+    )
+
+
+def action_required_mention() -> list[TranscriptEvent]:
+    """(g) Sarah is asked to do something (a task), not asked a direct
+    question — ACTION_REQUIRED."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return _spaced_events(
+        base,
+        MEETING_ID,
+        [
+            ("spk_0", "I'm Sarah, let's keep moving."),
+            ("spk_1", "Sarah, can you review the PR before end of day?"),
+        ],
+    )
+
+
+def informational_mention() -> list[TranscriptEvent]:
+    """(h) Sarah is mentioned only to be kept informed, no input/action
+    needed — INFORMATIONAL."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return _spaced_events(
+        base,
+        MEETING_ID,
+        [
+            ("spk_0", "I'm Sarah, go ahead."),
+            ("spk_1", "Just a heads up for Sarah, we finished the migration last night."),
+        ],
+    )
+
+
+def reference_mention() -> list[TranscriptEvent]:
+    """(i) Sarah's name comes up in passing, attributing a past
+    decision to her rather than addressing her directly — REFERENCE."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return _spaced_events(
+        base,
+        MEETING_ID,
+        [
+            ("spk_0", "I'm Raj from infra."),
+            ("spk_1", "Sarah already approved this approach last week, so we're good to go."),
+        ],
+    )
+
+
 def restated_question_dedup() -> list[TranscriptEvent]:
     """(e) The same question asked twice, in two separate windows —
     should dedup to a single DecisionRecord."""

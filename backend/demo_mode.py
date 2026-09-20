@@ -26,6 +26,18 @@ logger = logging.getLogger("ghost.demo")
 DEMO_MEETING_ID = "demo-meeting"
 SEND_INTERVAL_SECONDS = 2
 
+# A decision triggered by the script's last few lines can still be
+# mid-flight (Tier 2 LLM call, Cedar check, answer drafting, then the
+# debounce window itself) well after the scripted transcript finishes
+# sending — observed ~20s of tail latency in practice. Without this
+# grace period, the connection unregisters itself the instant the
+# script ends (see the FIRST_COMPLETED wait below), so a decision_batch
+# push for anything detected near the end of the script has nowhere to
+# go by the time it's ready. Real /ws/transcribe sessions don't have
+# this problem since the panel's connection stays open for the whole
+# capture, not just a fixed scripted duration.
+POST_SCRIPT_GRACE_SECONDS = 30
+
 # Scripted lines live as their own JSON fixture, not inline in this
 # module, so the demo script is easy to edit without touching session
 # logic. Note fixtures/demo_transcript.json has "Sarah" self-introduce
@@ -58,6 +70,12 @@ async def run_demo_session(websocket: WebSocket, log) -> None:
             log.info("sent demo event: %s: %r", event.speaker, event.text)
             await decision_pipeline.process_transcript_event(event)
             await asyncio.sleep(SEND_INTERVAL_SECONDS)
+        # Keeps this task (and therefore the WebSocket registration)
+        # alive past the last scripted line so background decision
+        # processing triggered by it has a real chance to reach the
+        # panel — see POST_SCRIPT_GRACE_SECONDS above.
+        log.info("scripted transcript finished; holding connection open %ss for in-flight decisions", POST_SCRIPT_GRACE_SECONDS)
+        await asyncio.sleep(POST_SCRIPT_GRACE_SECONDS)
 
     async def receive_control_messages() -> None:
         # Lets a speaker_override submitted mid-demo take effect, same

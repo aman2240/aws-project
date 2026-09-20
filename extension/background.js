@@ -82,6 +82,13 @@ async function startCapture() {
   await setSessionState({ status: 'capturing', meetingSessionId, tabId: tab.id });
 
   const { [IDENTITY_STORAGE_KEY]: identity } = await chrome.storage.local.get(IDENTITY_STORAGE_KEY);
+  // Read here (proven to work in this service-worker context) and
+  // passed along, rather than offscreen.js reading chrome.storage.local
+  // itself — chrome.storage is unavailable inside that specific
+  // offscreen document context on this install, for reasons that don't
+  // affect background.js or sidepanel.js, so offscreen.js no longer
+  // touches chrome.storage at all.
+  const { backendUrl } = await chrome.storage.local.get('backendUrl');
 
   chrome.runtime.sendMessage({
     type: START_CAPTURE,
@@ -90,6 +97,7 @@ async function startCapture() {
     meetingSessionId,
     watchedUserNameVariants: identity?.nameVariants ?? [],
     slackTarget: identity?.slackTarget ?? null,
+    backendUrl: backendUrl || null,
   });
 }
 

@@ -233,6 +233,13 @@ async def ws_transcribe(websocket: WebSocket, session_id: str | None = None):
                 # Partial results are dropped in this phase — only
                 # final results continue downstream.
                 continue
+            # Logged at INFO specifically so a live session's server
+            # log gives a direct answer to "is Transcribe actually
+            # hearing anything, and does it contain the watched name" —
+            # without this, a session that never triggers a decision is
+            # indistinguishable between "nothing was transcribed" and
+            # "things were transcribed but never matched Tier 1/Tier 2".
+            log.info("transcript: %s: %r (confidence=%.2f)", event.speaker, event.text, event.confidence)
             await websocket.send_json(event.model_dump(mode="json"))
             # process_transcript_event only ever blocks synchronously
             # on cheap buffering/regex work — the LLM call it may

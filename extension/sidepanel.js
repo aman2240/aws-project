@@ -420,6 +420,12 @@ chrome.runtime.onMessage.addListener((message) => {
       render(panelState);
       break;
     case CAPTURE_ERROR:
+      // The offscreen document that actually threw this closes itself
+      // right after broadcasting, so its own console is a near-
+      // impossible window to catch — the side panel's console (this
+      // one, already open and stable) is where the real stack trace
+      // is actually visible for debugging.
+      console.error('Capture error:', message.message, message.stack || '(no stack forwarded)');
       panelState.captureStatus = 'error';
       showIdleControls();
       setStatus(message.message || 'Something went wrong.');

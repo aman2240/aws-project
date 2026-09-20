@@ -10,7 +10,10 @@ cedarpy==4.12.0
 sqlalchemy[asyncio]==2.0.35
 asyncpg==0.29.0
 opensearch-py==2.7.1
-anthropic==1.6.0
+# anthropic SDK removed — LLM calls go through Groq's OpenAI-compatible
+# REST API directly via httpx (groq_llm.py), no SDK package needed.
+# (AWS Bedrock was tried in between and removed — blocked at the AWS
+# account level, unrelated to this project's code; see groq_llm.py.)
 pydantic-settings==2.5.2
 pytest==8.3.3
 pytest-asyncio==0.24.0

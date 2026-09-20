@@ -4,14 +4,21 @@ pipeline (Cedar -> draft -> Slack): the shared decision_pipeline
 singleton — the same one main.py wires up in production — gets its
 LLM client, callback, and decision_store monkeypatched for the
 duration of each test, so this exercises the real production wiring
-path rather than a parallel one. No real Anthropic/Slack network calls
+path rather than a parallel one. No real Groq/Slack network calls
 happen anywhere in this file.
 
-Uses the real shared SQLiteDecisionStore (backed by tests/conftest.py's
-isolated test_ghost.db) rather than a per-test store — SQLiteDecisionStore
-has no per-instance path to isolate the way Phase 4's JSONLDecisionStore
-did, since every instance talks to the same database.py engine. Each
-test's decisions stay disambiguated by meeting_id, same as production.
+Uses the real shared PostgresDecisionStore (backed by tests/conftest.py's
+isolated test database) rather than a per-test store — PostgresDecisionStore
+has no per-instance path to isolate, since every instance talks to the
+same database.py engine. Each test's decisions stay disambiguated by
+meeting_id, same as production.
+
+Covers the mention-type migration (CLAUDE.md's non-negotiable behavior:
+only DIRECT_REQUEST/ACTION_REQUIRED reach Slack): every classify_fn
+below returns the new mention_type/mention_quote schema instead of the
+old is_decision boolean, and the block-structure assertions match the
+new single "✓ Done" button layout (slack_notifier.py) rather than the
+old three-button (Approve/Reject/Join & Answer Live) one.
 """
 
 import asyncio
@@ -26,13 +33,18 @@ import cedar_policy
 import session_connections
 import slack_notifier
 from config import settings
-from decision_detector import decision_pipeline
+from decision_detector import MentionType, decision_pipeline
 from decision_store import decision_store as shared_decision_store
 from notification_pipeline import make_notification_pipeline
 from tests.fixtures.decision_fixtures import (
     MEETING_ID,
+    action_required_mention,
+    direct_request_mention,
+    informational_mention,
     one_clear_decision,
+    reference_mention,
     three_decisions_one_batch_window,
+    throwaway_name_mention,
 )
 
 
@@ -121,15 +133,20 @@ def _wire_pipeline(monkeypatch, classify_fn, decision_store):
 
 
 @pytest.mark.asyncio
-async def test_one_clear_decision_sends_one_slack_message(monkeypatch, fake_decision_store, captured_slack_calls):
+async def test_direct_request_sends_one_slack_message_with_new_block_layout(
+    monkeypatch, fake_decision_store, captured_slack_calls
+):
     expected_text = "Whether to ship on Friday or wait until Monday"
+    expected_quote = "Sarah, should we ship on Friday or wait until Monday?"
+    expected_context = "The team is deciding on a ship date."
 
     def classify_fn(content):
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": expected_quote,
             "requires_action_from": "Sarah",
             "decision_text": expected_text,
-            "context": "The team is deciding on a ship date.",
+            "context": expected_context,
             "confidence": 0.9,
             "urgency": "medium",
         }
@@ -146,19 +163,160 @@ async def test_one_clear_decision_sends_one_slack_message(monkeypatch, fake_deci
     assert call["channel"] == "U_FAKE"  # resolved from the sarah@example.com target
 
     blocks = call["blocks"]
+    header_blocks = [b for b in blocks if b["type"] == "header"]
     section_blocks = [b for b in blocks if b["type"] == "section"]
     actions_blocks = [b for b in blocks if b["type"] == "actions"]
-    assert len(section_blocks) == 1
-    assert expected_text in section_blocks[0]["text"]["text"]
+
+    # header, once for the whole message
+    assert len(header_blocks) == 1
+    assert "Meeting Ghost" in header_blocks[0]["text"]["text"]
+
+    # intro section + one combined content section per decision (just
+    # one decision in this batch) = 2 section blocks
+    assert len(section_blocks) == 2
+    content_text = section_blocks[1]["text"]["text"]
+    assert "Direct Request" in content_text  # humanized mention_type
+    assert expected_context in content_text  # context
+    assert f'> "{expected_quote}"' in content_text  # mention_quote as a blockquote
+    assert "Go with Friday. Source: no prior context." in content_text  # suggested reply
+    assert "🟡 Pending" in content_text  # status line
+
+    # single "✓ Done" button, correctly encoded value
     assert len(actions_blocks) == 1
     buttons = actions_blocks[0]["elements"]
-    assert len(buttons) == 2
-    assert buttons[0]["value"].endswith(":approve")
-    assert buttons[1]["value"].endswith(":reject")
+    assert len(buttons) == 1
+    assert buttons[0]["text"]["text"] == "✓ Done"
+    assert buttons[0]["action_id"] == "decision_done"
+
+    recent = await fake_decision_store.get_recent(MEETING_ID, limit=10)
+    matching = next(r for r in recent if r.decision_text == expected_text)
+    assert buttons[0]["value"] == f"{matching.id}:done"
+    assert matching.mention_type == MentionType.DIRECT_REQUEST
 
 
 @pytest.mark.asyncio
-async def test_three_decisions_send_one_slack_message_with_three_blocks(
+async def test_action_required_is_stored_and_sends_slack_message(
+    monkeypatch, fake_decision_store, captured_slack_calls
+):
+    expected_text = "Review the PR before end of day"
+
+    def classify_fn(content):
+        return {
+            "mention_type": "ACTION_REQUIRED",
+            "mention_quote": "Sarah, can you review the PR before end of day?",
+            "requires_action_from": "Sarah",
+            "decision_text": expected_text,
+            "context": "Asked to review a pending PR.",
+            "confidence": 0.9,
+            "urgency": "low",
+        }
+
+    _wire_pipeline(monkeypatch, classify_fn, fake_decision_store)
+
+    with _short_debounce(0.1):
+        for event in action_required_mention():
+            await decision_pipeline.process_transcript_event(event)
+        await asyncio.sleep(0.5)
+
+    assert len(captured_slack_calls) == 1
+    recent = await fake_decision_store.get_recent(MEETING_ID, limit=10)
+    matching = next(r for r in recent if r.decision_text == expected_text)
+    assert matching.mention_type == MentionType.ACTION_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_informational_mention_is_stored_but_not_notified(
+    monkeypatch, fake_decision_store, captured_slack_calls
+):
+    expected_text = "Sarah kept informed about the migration"
+
+    def classify_fn(content):
+        return {
+            "mention_type": "INFORMATIONAL",
+            "mention_quote": "Just a heads up for Sarah, we finished the migration last night.",
+            "requires_action_from": None,
+            "decision_text": expected_text,
+            "context": "No input needed, just keeping Sarah in the loop.",
+            "confidence": 0.9,
+            "urgency": "low",
+        }
+
+    _wire_pipeline(monkeypatch, classify_fn, fake_decision_store)
+
+    with _short_debounce(0.1):
+        for event in informational_mention():
+            await decision_pipeline.process_transcript_event(event)
+        await asyncio.sleep(0.5)
+
+    assert captured_slack_calls == []
+    recent = await fake_decision_store.get_recent(MEETING_ID, limit=10)
+    matching = next(r for r in recent if r.decision_text == expected_text)
+    assert matching.mention_type == MentionType.INFORMATIONAL
+    assert matching.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_reference_mention_is_stored_but_not_notified(
+    monkeypatch, fake_decision_store, captured_slack_calls
+):
+    expected_text = "Sarah's prior approval referenced"
+
+    def classify_fn(content):
+        return {
+            "mention_type": "REFERENCE",
+            "mention_quote": "Sarah already approved this approach last week, so we're good to go.",
+            "requires_action_from": None,
+            "decision_text": expected_text,
+            "context": "Raj mentions Sarah's earlier approval in passing.",
+            "confidence": 0.9,
+            "urgency": "low",
+        }
+
+    _wire_pipeline(monkeypatch, classify_fn, fake_decision_store)
+
+    with _short_debounce(0.1):
+        for event in reference_mention():
+            await decision_pipeline.process_transcript_event(event)
+        await asyncio.sleep(0.5)
+
+    assert captured_slack_calls == []
+    recent = await fake_decision_store.get_recent(MEETING_ID, limit=10)
+    matching = next(r for r in recent if r.decision_text == expected_text)
+    assert matching.mention_type == MentionType.REFERENCE
+
+
+@pytest.mark.asyncio
+async def test_no_action_mention_is_stored_but_not_notified(
+    monkeypatch, fake_decision_store, captured_slack_calls
+):
+    expected_text = "Small talk mentioning Sarah's name"
+
+    def classify_fn(content):
+        return {
+            "mention_type": "NO_ACTION",
+            "mention_quote": "Great to have you Sarah, hope the weather's nice where you are.",
+            "requires_action_from": None,
+            "decision_text": expected_text,
+            "context": "Just a greeting.",
+            "confidence": 0.9,
+            "urgency": "low",
+        }
+
+    _wire_pipeline(monkeypatch, classify_fn, fake_decision_store)
+
+    with _short_debounce(0.1):
+        for event in throwaway_name_mention():
+            await decision_pipeline.process_transcript_event(event)
+        await asyncio.sleep(0.5)
+
+    assert captured_slack_calls == []
+    recent = await fake_decision_store.get_recent(MEETING_ID, limit=10)
+    matching = next(r for r in recent if r.decision_text == expected_text)
+    assert matching.mention_type == MentionType.NO_ACTION
+
+
+@pytest.mark.asyncio
+async def test_three_decisions_send_one_slack_message_with_three_done_buttons(
     monkeypatch, fake_decision_store, captured_slack_calls
 ):
     def classify_fn(content):
@@ -170,7 +328,8 @@ async def test_three_decisions_send_one_slack_message_with_three_blocks(
         else:
             text = "Whether to delay the release to next Tuesday"
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": last_line,
             "requires_action_from": "Sarah",
             "decision_text": text,
             "context": "Discussion during the review.",
@@ -187,12 +346,14 @@ async def test_three_decisions_send_one_slack_message_with_three_blocks(
 
     assert len(captured_slack_calls) == 1
     blocks = captured_slack_calls[0]["blocks"]
+    # intro section + one combined content section per decision
     section_blocks = [b for b in blocks if b["type"] == "section"]
     actions_blocks = [b for b in blocks if b["type"] == "actions"]
-    assert len(section_blocks) == 3
+    assert len(section_blocks) == 4  # 1 intro + 3 per-decision
     assert len(actions_blocks) == 3
     for actions in actions_blocks:
-        assert len(actions["elements"]) == 2
+        assert len(actions["elements"]) == 1
+        assert actions["elements"][0]["action_id"] == "decision_done"
 
 
 @pytest.mark.asyncio
@@ -205,7 +366,8 @@ async def test_policy_check_failure_sends_no_slack_message(monkeypatch, fake_dec
 
     def classify_fn(content):
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": "Sarah, should we ship on Friday or wait until Monday?",
             "requires_action_from": "Sarah",
             "decision_text": "Whether to ship on Friday or wait until Monday",
             "context": "ctx",
@@ -236,7 +398,8 @@ async def test_draft_timeout_still_sends_with_fallback_text(monkeypatch, fake_de
 
     def classify_fn(content):
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": "Sarah, should we ship on Friday or wait until Monday?",
             "requires_action_from": "Sarah",
             "decision_text": "Whether to ship on Friday or wait until Monday",
             "context": "ctx",
@@ -253,7 +416,7 @@ async def test_draft_timeout_still_sends_with_fallback_text(monkeypatch, fake_de
 
     assert len(captured_slack_calls) == 1
     blocks = captured_slack_calls[0]["blocks"]
-    section = next(b for b in blocks if b["type"] == "section")
+    section = blocks[-2] if blocks[-1]["type"] == "actions" else blocks[-1]
     assert "No draft available" in section["text"]["text"]
 
 
@@ -265,7 +428,8 @@ async def test_allowed_decision_pushes_decision_batch_with_drafted_answer(
 
     def classify_fn(content):
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": "Sarah, should we ship on Friday or wait until Monday?",
             "requires_action_from": "Sarah",
             "decision_text": expected_text,
             "context": "ctx",
@@ -288,6 +452,7 @@ async def test_allowed_decision_pushes_decision_batch_with_drafted_answer(
     pushed = message["decisions"][0]
     assert pushed["decision_text"] == expected_text
     assert pushed["status"] == "pending"
+    assert pushed["mention_type"] == "DIRECT_REQUEST"
     assert pushed["drafted_answer"] == "Go with Friday. Source: no prior context."
 
 
@@ -299,7 +464,8 @@ async def test_denied_decision_pushes_decision_batch_without_drafted_answer(
 
     def classify_fn(content):
         return {
-            "is_decision": True,
+            "mention_type": "DIRECT_REQUEST",
+            "mention_quote": "Sarah, should we ship on Friday or wait until Monday?",
             "requires_action_from": "Sarah",
             "decision_text": "Whether to ship on Friday or wait until Monday",
             "context": "ctx",

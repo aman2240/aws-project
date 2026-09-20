@@ -27,6 +27,7 @@ Ghost does not dial into a meeting unattended. "Can't attend" means a muted brow
 - **Cedar policy check gates every notification.** "Deny" means log the decision, send nothing.
 - **Stop condition:** manual "Stop Ghost" control in the side panel, plus detecting the Meet tab closing.
 - **Consent indicator:** a persistent "Ghost is listening" element in the side panel whenever capture is active.
+- Only DIRECT_REQUEST and ACTION_REQUIRED mention types reach Slack; INFORMATIONAL, REFERENCE, and NO_ACTION mentions are stored but never notified.
 
 ## Repo structure
 
@@ -95,8 +96,13 @@ Build phase by phase, in this order. Each phase has its own exit criteria — tr
   `ghostSession`, shape `{ status: 'idle'|'capturing'|'error', meetingSessionId: string|null,
   tabId: number|null }`. Session storage (not in-memory globals) so a service-worker restart
   mid-call doesn't lose track of an in-progress session.
-- **Backend URL:** offscreen.js reads it from `chrome.storage.local` key `backendUrl`, default
-  `ws://localhost:8000/ws/transcribe`. Unset/empty falls back to the default.
+- **Backend URL:** stored in `chrome.storage.local` key `backendUrl`, default
+  `ws://localhost:8000/ws/transcribe`. Unset/empty falls back to the default. Read by
+  background.js (not offscreen.js — `chrome.storage` was found to be unavailable inside the
+  offscreen document's own execution context on at least one real install, for reasons that don't
+  affect the service worker or side panel contexts of the same extension) and passed to
+  offscreen.js as a field on the `START_CAPTURE` message, the same way `watchedUserNameVariants`/
+  `slackTarget` already were. offscreen.js does not call `chrome.storage` at all as of this fix.
 - **PCM wire format:** raw binary WebSocket frames (not JSON-wrapped), Int16 PCM, mono, 16kHz,
   4096 samples (8192 bytes) per frame. Phase 2's backend WS handler needs to expect exactly this,
   not a JSON envelope.
@@ -136,12 +142,25 @@ Build phase by phase, in this order. Each phase has its own exit criteria — tr
 
 **Phase 3 (decision detection):**
 
-- **LLM model:** CLAUDE.md's "Claude 3 Haiku" is retired — Tier 2 uses `claude-haiku-4-5`
-  (`backend/decision_detector.py`, constant `LLM_MODEL`, public — Phase 4's answer_drafter.py
-  reuses it and `LLM_TIMEOUT_SECONDS`), the current latency-optimized model in the same tier.
-  Called via the `anthropic` SDK (added to `requirements.txt`, pinned `1.6.0`) with
-  `output_config={"format": {"type": "json_schema", ...}}` for structured JSON, wrapped in
-  `asyncio.wait_for(..., timeout=4.0)`.
+- **LLM model:** CLAUDE.md's "Claude 3 Haiku" is retired — Tier 2 originally used `claude-haiku-4-5`
+  via the direct Anthropic API (`backend/decision_detector.py`, constant `LLM_MODEL`, public —
+  Phase 4's answer_drafter.py reuses it and `LLM_TIMEOUT_SECONDS`), wrapped in
+  `asyncio.wait_for(..., timeout=4.0)`. **Post-launch switch to AWS Bedrock** (see the migration
+  note after Phase 6's own migration note below): `LLM_MODEL` now holds a Bedrock model ID
+  (`bedrock_llm.BEDROCK_MODEL_ID`, `anthropic.claude-haiku-4-5-20251001-v1:0` — this project's own
+  confirmed Bedrock Model catalog entry; re-verify there if it ever needs to change) rather than
+  Anthropic's direct-API model name, and calls go through `backend/bedrock_llm.py`'s
+  `BedrockMessagesClient` — a minimal
+  httpx-based client hitting Bedrock's `invoke_model` REST endpoint directly with a Bedrock API
+  key (bearer token from the Bedrock console's "API keys" page) as `Authorization: Bearer <key>` —
+  not the `anthropic` SDK/package, which was removed from `requirements.txt` entirely. This shim
+  deliberately mimics the exact `.messages.create(...) -> response.content[i].type/.text` shape the
+  `anthropic` SDK had, so `decision_detector.py`/`answer_drafter.py`'s calling code, and every
+  existing test's fake LLM client (which already duck-typed that same shape), needed no changes —
+  only the concrete class `DecisionPipeline`/`answer_drafter.py` construct by default changed.
+  Structured JSON-schema output (`output_config=...`) is dropped in the Bedrock path — unverified
+  whether Bedrock's `invoke_model` accepts that exact parameter — relying instead on the existing
+  prompt-plus-parse-and-validate-with-graceful-fallback path already in `_classify_window`.
 - **Per-session name watching is not automatic:** `DecisionPipeline.set_watch_names(meeting_id,
   names)` must be called before Tier 1 will ever match anything. Phase 4's session_init handshake
   (see below) is what actually calls this for real sessions now — see that section, not this one,
@@ -443,3 +462,4 @@ see the migration note after Phase 6 for the swap itself:**
 - When a phase settles a decision that affects later phases (e.g. the final diarization implementation, the debounce window length), update this file so later phases inherit it instead of re-deciding it.
 - Manual, human-only steps — Slack app creation/install, AWS IAM and budget alarms — are done outside of Claude Code. Ask for the credentials/config rather than trying to provision them.
 - If a proposed change would expand scope (a platform beyond Meet, a notification channel beyond Slack, a UI control beyond what's listed), flag it before building instead of adding it silently.
+- **Push progress automatically.** The canonical remote is `https://github.com/aman2240/aws-project.git`. After every commit made in a Claude Code session (per the one-commit-per-completed-phase convention above), push it to that remote on the current working branch without waiting for separate per-push confirmation — this note is the standing authorization for that. Never force-push; if a push is rejected because the remote has diverged, pull/rebase (or ask the user) rather than overwriting remote history.

@@ -28,7 +28,10 @@ class Settings(BaseSettings):
     slack_bot_token: str
     slack_signing_secret: str
 
-    # LLM — required. Powers decision detection and drafted answers.
+    # LLM — required. Powers decision detection and drafted answers via
+    # Groq (groq_llm.py) — a Groq API key (console.groq.com), not AWS
+    # Bedrock (tried and blocked at the AWS account level — see
+    # groq_llm.py's docstring) or a direct Anthropic key.
     llm_api_key: str
 
     # Postgres — required, no default. A missing/unset value must fail
